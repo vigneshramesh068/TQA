@@ -10,10 +10,10 @@ import plotly.express as px
 import io
 
 # =========================
-# Config
+# Page & Title
 # =========================
 st.set_page_config(page_title="Ticket Quality Audit (Rule-based)", layout="wide")
-st.title("🧮 Ticket Quality Audit — Rule-based (Max Score = 7)")
+st.title("🧮 Ticket Quality Audit — Rule-based (no Transformer)")
 st.markdown("---")
 
 # =========================
@@ -24,6 +24,42 @@ with st.sidebar:
     st.subheader("📁 Upload Files")
     ticket_file = st.file_uploader("Upload Ticket Data (Excel/CSV)", type=['xlsx', 'xls', 'csv'])
     mapping_file = st.file_uploader("Upload Mapping File (Excel/CSV) — optional", type=['xlsx', 'xls', 'csv'])
+
+    st.subheader("📥 Download Templates")
+    # Ticket template (headers only)
+    ticket_template_cols = [
+        "Number", "Opened", "Resolved", "Closed", "Category",
+        "Work notes", "Additional comments", "Resolution notes",
+        "Assignment group", "Service offering",
+        "Reopen count", "Reassignment count",
+        "Assigned to", "Portfolio", "Domain",
+        # NEW: affected user for author-aware confirmation
+        "Affected User"
+    ]
+    ticket_template_buf = io.BytesIO()
+    pd.DataFrame(columns=ticket_template_cols).to_excel(ticket_template_buf, index=False, sheet_name="TicketTemplate")
+    ticket_template_buf.seek(0)
+    st.download_button(
+        label="📄 Download Ticket Template (Excel)",
+        data=ticket_template_buf,
+        file_name="ticket_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
+
+    # Mapping template (headers only)
+    mapping_template_cols = ["Assignment Group", "Service Offering"]
+    mapping_template_buf = io.BytesIO()
+    pd.DataFrame(columns=mapping_template_cols).to_excel(mapping_template_buf, index=False, sheet_name="MappingTemplate")
+    mapping_template_buf.seek(0)
+    st.download_button(
+        label="🔗 Download Mapping Template (Excel)",
+        data=mapping_template_buf,
+        file_name="mapping_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
+
     run_audit = st.button("🚀 Run Audit", type="primary", use_container_width=True)
 
 # =========================
@@ -48,6 +84,14 @@ COLUMN_MAP_LOWER = {
     "assigned to": "assigned_to",
     "portfolio": "portfolio",
     "domain": "domain",
+    # NEW: affected user synonyms
+    "affected user": "affected_user",
+    "user name": "affected_user",
+    "requester": "affected_user",
+    "caller": "affected_user",
+    "end user": "affected_user",
+    "impacted user": "affected_user",
+    "reported by": "affected_user",
 }
 
 # =========================
@@ -95,7 +139,7 @@ def detect_3sr_policy(text: str) -> bool:
     Heuristic for 3SR (3 reminders + no response) or explicit policy wording.
     Triggers if:
       - >= 3 reminders OR phrases like "3rd reminder" / "final reminder" / "3-strike" / "3SR"
-      - AND phrases like "no response/no reply/unresponsive/no update from user"
+      - AND phrases like "no response / no reply / unresponsive / no update from user"
       - OR explicit closure wording "closed as per 3-strike rule / 3SR"
     """
     if not text:
@@ -126,14 +170,41 @@ def detect_3sr_policy(text: str) -> bool:
 
     return (explicit_policy or ((reminder_count >= 3) or strong_markers) and no_response)
 
-def check_notes_quality(notes, comments, resolution_summary=None):
+# --- NEW: extract author names from lines like "YYYY-MM-DD ... - Name (Work notes)"
+def extract_authors(raw_text: str):
+    """
+    Extract author names from concatenated notes text.
+    Looks for patterns: "... - NAME (Work notes|Additional comments|Resolution...)".
+    Returns a set of lowercase, stripped names.
+    """
+    if not raw_text:
+        return set()
+    s = str(raw_text)
+    authors = set()
+    # Pattern with timestamp: 2025-08-25 15:48:22 - Rakesh Kumar (Additional comments)
+    for m in re.finditer(r'\d{4}-\d{2}-\d{2}[^-\n]*-\s*([^\(\n]+?)\s*\(', s):
+        name = m.group(1).strip().lower()
+        if name:
+            authors.add(name)
+    # Fallback: any " - Name (" without date
+    for m in re.finditer(r'\-\s*([A-Za-z][A-Za-z0-9 .,\-\']+?)\s*\(', s):
+        name = m.group(1).strip().lower()
+        if name:
+            authors.add(name)
+    return authors
+
+def check_notes_quality(notes, comments, resolution_summary=None, affected_user=None):
     """
     Rule-based scoring (max 4 here):
       - Notes exist & detailed: +2 (exists + detail)
       - User communication: +1
       - User confirmation OR 3SR: +1
 
-    Resolution (+1), Mapping (+1), SLA Met (+1) are scored by caller.
+    Resolution (+1) & Mapping (+1) are scored by caller.
+
+    ENHANCEMENTS:
+    - Conflict resolver: NO-RESPONSE / 3SR overrides confirmation.
+    - Author-aware confirmation: generic confirmation only counts if Affected User authored notes.
     """
     score = 0
     issues = []
@@ -178,20 +249,22 @@ def check_notes_quality(notes, comments, resolution_summary=None):
         'tried contacting', 'tried to contact', 'connected with user'
     ]
 
-    # Expanded confirmation patterns (regex, case-insensitive)
-    confirmation_regexes = [
+    # Strong confirmation (explicit user acknowledgement)
+    strong_confirmation_regexes = [
         r'\b(user|customer)\s+(confirmed|approval|approved|acknowledged)\b',
         r'\bconfirmation\s+(received|acknowledged)\b',
-        r'\bthanks?\s+for\s+the\s+confirmation\b',
+        r'\bverified\s+by\s+(user|customer)\b',
+        r'\bresolution\s+accepted\b',
+        r'\bissue\s+resolved\b', r'\bproblem\s+resolved\b'
+    ]
+    # Generic confirmation/closure phrases (require author-awareness)
+    generic_confirmation_regexes = [
         r'\b(ok(ay)?\s+to\s+close|please\s+close\s+(the\s+)?ticket|ticket\s+can\s+be\s+closed)\b',
         r'\byou\s+can\s+close\s+(the\s+)?ticket\b',
-        r'\bas\s+agreed\s+by\s+the\s+user.*(we\s+are\s+)?closing\s+(this|the)\s+ticket\b',
         r'\b(view|report|form|screen|process)\s+is\s+working\b',
         r'\b(working\s+fine\s+now|working\s+as\s+expected)\b',
-        r'\b(fixed\s+and\s+verified|issue\s+resolved|problem\s+resolved|resolution\s+accepted)\b',
-        r'\bverified\s+by\s+(user|customer)\b',
         r'\bthank(s| you)[\s,]+.*(it|this)\s+works\b',
-        r'\bcan\s+be\s+closed\b',
+        r'\bcan\s+be\s+closed\b'
     ]
 
     # Regex to detect dates like 2025-10-27 / 2025/10/27 / 10/27/2025
@@ -214,10 +287,33 @@ def check_notes_quality(notes, comments, resolution_summary=None):
         if len(s_lower) <= 200:
             issues.append("Updates lack detail")
 
-    # --- Detect confirmation and 3SR first (so they imply communication) ---
-    has_confirmation = any(re.search(rx, s_lower) for rx in confirmation_regexes)
+    # --- Detect confirmation, NO-RESPONSE, and 3SR (conflict-aware) ---
+    no_response_regexes = [
+        r'\bno\s+response\b', r'\bno\s+reply\b', r'\bnot\s+responded\b',
+        r'\bunresponsive\b', r'\bno\s+updates?\s+from\s+user\b',
+        r'\bno\s+update\s+from\s+user\b', r"didn'?t\s+get\s+any\s+response"
+    ]
+    has_no_response = any(re.search(rx, s_lower) for rx in no_response_regexes)
     closed_by_3sr = detect_3sr_policy(s_lower)
-    closure_policy = 'User Confirmed' if has_confirmation else ('3SR' if closed_by_3sr else '')
+
+    # Author-aware: did the affected user write any notes?
+    authors_lower = extract_authors(raw)  # set of lowercase author names
+    affected_user_lower = str(affected_user).strip().lower() if affected_user and not pd.isna(affected_user) else ''
+
+    user_authored_any = affected_user_lower != '' and affected_user_lower in authors_lower
+
+    # Confirmation calculation:
+    has_strong_confirmation = any(re.search(rx, s_lower) for rx in strong_confirmation_regexes)
+    has_generic_confirmation = any(re.search(rx, s_lower) for rx in generic_confirmation_regexes)
+
+    # Only accept generic confirmation if the affected user authored entries
+    has_confirmation = has_strong_confirmation or (has_generic_confirmation and user_authored_any)
+
+    # Resolve contradictions: NO-RESPONSE / 3SR override confirmation
+    if closed_by_3sr or has_no_response:
+        has_confirmation = False
+
+    closure_policy = '3SR' if closed_by_3sr else ('User Confirmed' if has_confirmation else '')
 
     # --- Communication detection (with implication) ---
     has_user_update = any(p in s_lower for p in user_update_phrases)
@@ -404,8 +500,8 @@ if run_audit:
 
                 st.success(f"✅ Loaded {len(tickets_df)} tickets")
 
-                # Quality max score depends on mapping presence (7 with mapping, 6 without)
-                MAX_SCORE = 7 if mapping_df is not None else 6
+                # Quality max score depends on mapping presence
+                MAX_SCORE = 6 if mapping_df is not None else 5
 
                 # Process tickets
                 results = []
@@ -424,56 +520,43 @@ if run_audit:
                         'Category': row.get('category', ''),
                         'Duration_Days': None,
                         'Breach': 0,
-                        'SLA_Point': 0,   # +1 if SLA met, else 0
                         'Reopen_Count': 0,
                         'Reassignment_Count': 0,
                         'Issues': [],
                         'Closure_Policy': '',
-                        'Quality_Score': 0,          # cumulative points
+                        'Quality_Score': 0,          # out of MAX_SCORE
                         'Quality_Max': MAX_SCORE,
                     }
 
-                    # SLA dimension (+1 if met)
-                    have_dates = ('created_date' in tickets_df.columns) and ('resolved_date' in tickets_df.columns)
-                    if have_dates:
+                    # SLA calc
+                    if ('created_date' in tickets_df.columns) and ('resolved_date' in tickets_df.columns):
                         days = calculate_business_days(row.get('created_date'), row.get('resolved_date'))
                         res['Duration_Days'] = days
                         is_breach = check_breach(days, row.get('category', ''))
-                        if is_breach is True:
-                            res['Breach'] = 1
-                            res['SLA_Point'] = 0
-                            res['Issues'].append(f"SLA breach ({days} business days) → SLA point 0")
-                        elif is_breach is False:
-                            res['Breach'] = 0
-                            res['SLA_Point'] = 1
-                        else:
-                            # couldn't evaluate
-                            res['Issues'].append("SLA not evaluated (invalid dates)")
-                            res['SLA_Point'] = 0
-                    else:
-                        res['Issues'].append("SLA not evaluated (missing dates)")
-                        res['SLA_Point'] = 0
+                        res['Breach'] = 1 if (is_breach is True) else 0
+                        if is_breach:
+                            res['Issues'].append(f"SLA breach ({days} business days)")
 
-                    # Notes quality (+ communication + confirmation/3SR) → up to +4
+                    # Notes quality (+ communication + confirmation/3SR)
                     nq_score, nq_issues, info = check_notes_quality(
                         row.get('work_notes'),
                         row.get('additional_comments'),
-                        row.get('resolution_summary') if 'resolution_summary' in tickets_df.columns else None
+                        row.get('resolution_summary') if 'resolution_summary' in tickets_df.columns else None,
+                        affected_user=row.get('affected_user') if 'affected_user' in tickets_df.columns else None
                     )
                     res['Quality_Score'] += nq_score
                     res['Issues'].extend(nq_issues)
                     res['Closure_Policy'] = info.get('closure_policy', '')
 
-                    # Resolution summary quality → +1
+                    # Resolution summary credit
                     if 'resolution_summary' in tickets_df.columns:
                         has_res, res_msg = check_resolution_quality(row.get('resolution_summary'))
                         if has_res:
                             res['Quality_Score'] += 1
                         else:
                             res['Issues'].append(res_msg)
-                    # else: no resolution column → no point (keeps fairness consistent)
 
-                    # Mapping (only if file provided) → +1
+                    # Mapping credit (only if file provided) — 1:N validation
                     if mapping_df is not None:
                         ok, msg = validate_mapping_multi(
                             row.get('assignment_group'),
@@ -486,10 +569,7 @@ if run_audit:
                         else:
                             res['Issues'].append(msg)
 
-                    # SLA point add (+1 or 0)
-                    res['Quality_Score'] += res['SLA_Point']
-
-                    # Reopen/Reassignment (only as issues, not scoring)
+                    # Reopen/Reassignment
                     try:
                         rc = int(float(row.get('reopen', 0)))
                         res['Reopen_Count'] = rc
@@ -523,8 +603,6 @@ if run_audit:
                 avg_quality = results_df['Quality_Score'].mean() if total_tickets else 0
                 avg_quality_pct = results_df['Quality_Percent'].mean() if total_tickets else 0
                 total_reopens = int(results_df['Reopen_Count'].sum())
-                # Denominator shown = 7 with mapping, else 6
-                denom = int(results_df['Quality_Max'].max() if total_tickets else MAX_SCORE)
 
                 c1, c2, c3, c4, c5 = st.columns(5)
                 with c1:
@@ -532,7 +610,7 @@ if run_audit:
                 with c2:
                     st.metric("Breached Tickets", f"{breached:,}")
                 with c3:
-                    st.metric(f"Avg Quality Score (/ {denom})", f"{avg_quality:.1f}/{denom}")
+                    st.metric(f"Avg Quality Score (/ {int(results_df['Quality_Max'].max() if total_tickets else MAX_SCORE)})", f"{avg_quality:.1f}/{int(results_df['Quality_Max'].max() if total_tickets else MAX_SCORE)}")
                 with c4:
                     st.metric("Avg Quality %", f"{avg_quality_pct:.1f}%")
                 with c5:
@@ -543,18 +621,6 @@ if run_audit:
                 st.header("📈 Trend & Performance Analysis")
 
                 st.subheader("📆 Month-over-Month (Closed Month)")
-                def month_frame_from_closed(df: pd.DataFrame, closed_col='Closed_Date'):
-                    tmp = df.copy()
-                    if closed_col not in tmp.columns:
-                        return pd.DataFrame()
-                    tmp[closed_col] = pd.to_datetime(tmp[closed_col], errors='coerce')
-                    tmp = tmp.dropna(subset=[closed_col])
-                    if tmp.empty:
-                        return tmp
-                    tmp['MonthPeriod'] = tmp[closed_col].dt.to_period('M')
-                    tmp['MonthLabel'] = tmp['MonthPeriod'].dt.strftime('%b %Y')
-                    return tmp
-
                 mdf = month_frame_from_closed(results_df, closed_col='Closed_Date')
                 if not mdf.empty:
                     monthly = mdf.groupby(['MonthPeriod', 'MonthLabel']).agg(
@@ -807,19 +873,26 @@ if run_audit:
 else:
     st.info("👆 Upload your ticket file (and optional mapping) and click **Run Audit** to start.")
     st.markdown("---")
-    st.header("📖 Scoring Dimensions (7 total with mapping)")
+    st.header("📖 Accepted Columns (case-insensitive)")
     st.markdown("""
-1. Notes exist  
-2. Notes detailed (follow-ups & dates or length)  
-3. Communication with user  
-4. User confirmation **or** 3SR  
-5. Resolution notes quality  
-6. AG→SO mapping valid *(only if mapping file provided)*  
-7. **SLA Met** (no breach)
+- **Number** → Ticket ID string  
+- **Opened** → Creation date/time  
+- **Resolved** → Resolution/close date/time (system)  
+- **Closed** → Final closed date/time (used to derive **Closed Month** as `MMM YYYY`)  
+- **Category**  
+- **Work notes**, **Additional comments**  
+- **Resolution notes** / **Resolution summary** / **Closure notes** (any one)  
+- **Assignment group**, **Service offering**  
+- **Reopen count**, **Reassignment count**  
+- **Assigned to**, **Portfolio**, **Domain**  
+- **Affected User** *(recommended, for author-aware confirmation detection)*
 
-**Max score** = 7 (with mapping) or 6 (without mapping).  
-**Quality %** = (Score ÷ Max) × 100.
+**Mapping file (optional, 1:N supported):**  
+Column 1 → Assignment Group  
+Column 2 → Service Offering  
+If multiple rows exist for the same Assignment Group with different Service Offerings, **all** of them are accepted as valid.  
+Correct AG↔SO adds **+1** to quality; if mapping not uploaded, max score is **5**.
 """)
 
 st.markdown("---")
-st.markdown("**Ticket Quality Audit System — Rule-based (Max 7)**")
+st.markdown("**Ticket Quality Audit System — Rule-based**")
